@@ -58,3 +58,16 @@ properties:
     type: int
     default: 5
 
+  single-sensor-mode:
+    type: boolean
+    description: Enable single-sensor fallback behavior.
+  single-sensor-primary:
+    type: int
+    description: Which sensor (1 or 2) is kept active in single-sensor mode.
+    enum:
+      - 1
+      - 2
+  single-sensor-transform:
+    type: array
+    description: >
+      Fixed 2x2 transform matrix (a b c d) encoded as integers where 1000 == 1.0.
