@@ -4,11 +4,19 @@
 #include <zephyr/device.h>
 #include <drivers/input_processor.h>
 #include <math.h>
+#include <limits.h>
 #include <dt-bindings/zmk/p2sm.h>
 #include <zephyr/logging/log.h>
 #include <zmk/keymap.h>
 #include "drivers/p2sm_runtime.h"
 #include "zephyr/drivers/gpio.h"
+
+#ifndef CONFIG_POINTER_2S_MIXER_VEL_GATE_THR
+#define CONFIG_POINTER_2S_MIXER_VEL_GATE_THR 0
+#endif
+#ifndef CONFIG_POINTER_2S_MIXER_VEL_GATE_DEADZONE
+#define CONFIG_POINTER_2S_MIXER_VEL_GATE_DEADZONE 0
+#endif
 
 #if IS_ENABLED(CONFIG_SETTINGS)
 #ifndef CONFIG_SETTINGS_RUNTIME
@@ -44,6 +52,10 @@ struct zip_pointer_2s_mixer_config {
     const uint8_t sensor1_pos[3], sensor2_pos[3];
     const uint8_t ball_radius; // up to 127
 
+    const bool single_sensor_mode;
+    const uint8_t single_sensor_primary;
+    const int32_t single_sensor_transform[4];
+
     // feedback (i.e. vibration)
     // ToDo refactor to accept any behavior
     const struct gpio_dt_spec feedback_gpios;
@@ -67,6 +79,7 @@ struct zip_pointer_2s_mixer_data {
 
     bool initialized;
     uint32_t last_rpt_time, last_rpt_time_twist;
+    int64_t last_pointer_emit;
     int16_t rpt_x, rpt_y;
     float rpt_x_remainder, rpt_y_remainder, rpt_twist_remainder;
     float move_coef, twist_coef;
@@ -87,6 +100,11 @@ struct zip_pointer_2s_mixer_data {
 
     uint32_t last_twist, debounce_start; // to filter out single events as they are probably accidental
     int8_t last_twist_direction; // to filter out first event in the opposite direction
+
+    bool single_sensor_enabled;
+    uint8_t single_sensor_primary;
+    float single_sensor_transform[2][2];
+    uint8_t single_sensor_log_samples;
 
     float ema_delta_y, ema_translation;
     bool ema_initialized;
@@ -111,6 +129,7 @@ struct zip_pointer_2s_mixer_data {
 static int data_init(const struct device *dev);
 static void apply_rotation(float matrix[3][3], float dx, float dy, float *out_x, float *out_y);
 static void apply_coef(float coef, float *x, float *y);
+static void apply_single_sensor_transform(const struct zip_pointer_2s_mixer_data *data, float *x, float *y);
 static struct dataframe_history_entry* dataframe_history_add(const struct device *dev, const struct p2sm_dataframe *dataframe);
 static bool dataframe_history_cleanup(const struct device *dev, uint32_t cutoff_time);
 
@@ -124,6 +143,22 @@ static int process_and_report(const struct device *dev) {
         apply_rotation(data->rotation_matrix1, data->values.s1_x, data->values.s1_y, &rotated_x, &rotated_y);
         data->twist_values.s1_x += rotated_x;
         data->twist_values.s1_y += rotated_y;
+
+        if (data->single_sensor_enabled && data->single_sensor_primary == 1) {
+            const float pre_transform_x = rotated_x;
+            const float pre_transform_y = rotated_y;
+            apply_single_sensor_transform(data, &rotated_x, &rotated_y);
+            if (data->single_sensor_log_samples < 1000) {
+                LOG_INF("Single sensor sample %u (sensor %d): pre=(%d,%d) post=(%d,%d)",
+                        data->single_sensor_log_samples,
+                        data->single_sensor_primary,
+                        (int)(pre_transform_x * 1000.0f),
+                        (int)(pre_transform_y * 1000.0f),
+                        (int)(rotated_x * 1000.0f),
+                        (int)(rotated_y * 1000.0f));
+                data->single_sensor_log_samples++;
+            }
+        }
 
         apply_coef(data->move_coef, &rotated_x, &rotated_y);
         if (dt > CONFIG_POINTER_2S_MIXER_REMAINDER_TTL) {
@@ -144,6 +179,22 @@ static int process_and_report(const struct device *dev) {
         data->twist_values.s2_x += rotated_x;
         data->twist_values.s2_y += rotated_y;
 
+        if (data->single_sensor_enabled && data->single_sensor_primary == 2) {
+            const float pre_transform_x = rotated_x;
+            const float pre_transform_y = rotated_y;
+            apply_single_sensor_transform(data, &rotated_x, &rotated_y);
+            if (data->single_sensor_log_samples < 1000) {
+                LOG_INF("Single sensor sample %u (sensor %d): pre=(%d,%d) post=(%d,%d)",
+                        data->single_sensor_log_samples,
+                        data->single_sensor_primary,
+                        (int)(pre_transform_x * 1000.0f),
+                        (int)(pre_transform_y * 1000.0f),
+                        (int)(rotated_x * 1000.0f),
+                        (int)(rotated_y * 1000.0f));
+                data->single_sensor_log_samples++;
+            }
+        }
+
         apply_coef(data->move_coef, &rotated_x, &rotated_y);
         if (dt > CONFIG_POINTER_2S_MIXER_REMAINDER_TTL) {
             data->rpt_x_remainder = rotated_x;
@@ -161,6 +212,30 @@ static int process_and_report(const struct device *dev) {
     data->rpt_y = (int16_t) data->rpt_y_remainder;
     data->rpt_x_remainder -= data->rpt_x;
     data->rpt_y_remainder -= data->rpt_y;
+
+#if IS_ENABLED(CONFIG_POINTER_2S_MIXER_VEL_GATE_EN)
+    if (data->rpt_x != 0 || data->rpt_y != 0) {
+        const int abs_x = abs(data->rpt_x);
+        const int abs_y = abs(data->rpt_y);
+        if (abs_x <= CONFIG_POINTER_2S_MIXER_VEL_GATE_DEADZONE &&
+            abs_y <= CONFIG_POINTER_2S_MIXER_VEL_GATE_DEADZONE) {
+            int64_t dt_ticks = (int64_t)now - data->last_pointer_emit;
+            if (dt_ticks < 1) {
+                dt_ticks = 1;
+            } else if (dt_ticks > INT32_MAX) {
+                dt_ticks = INT32_MAX;
+            }
+            const float magnitude = sqrtf((float)(abs_x * abs_x) + (float)(abs_y * abs_y));
+            const int speed_x100 = (int)((100.0f * magnitude) / (float)dt_ticks);
+            if (speed_x100 < CONFIG_POINTER_2S_MIXER_VEL_GATE_THR) {
+                data->rpt_x = 0;
+                data->rpt_y = 0;
+                data->rpt_x_remainder = 0;
+                data->rpt_y_remainder = 0;
+            }
+        }
+    }
+#endif
 
 #if IS_ENABLED(CONFIG_POINTER_2S_MIXER_SCROLL_DISABLES_POINTER)
     if (now - data->last_rpt_time_twist < CONFIG_POINTER_2S_MIXER_POINTER_AFTER_SCROLL_ACTIVATION) {
@@ -182,6 +257,7 @@ static int process_and_report(const struct device *dev) {
             input_report(dev, INPUT_EV_REL, INPUT_REL_Y, data->rpt_y, true, K_NO_WAIT);
             data->rpt_y = 0;
         }
+        data->last_pointer_emit = now;
     }
 
     data->last_rpt_time = now;
@@ -237,6 +313,14 @@ static void apply_rotation(float matrix[3][3], const float dx, const float dy, f
 static void apply_coef(const float coef, float *x, float *y) {
     *x *= coef;
     *y *= coef;
+}
+
+static void apply_single_sensor_transform(const struct zip_pointer_2s_mixer_data *data, float *x, float *y) {
+    const float (*m)[2] = data->single_sensor_transform;
+    const float transformed_x = m[0][0] * *x + m[0][1] * *y;
+    const float transformed_y = m[1][0] * *x + m[1][1] * *y;
+    *x = transformed_x;
+    *y = transformed_y;
 }
 
 static struct dataframe_history_entry* dataframe_history_add(const struct device *dev, const struct p2sm_dataframe *dataframe) {
@@ -463,6 +547,9 @@ static int sy_handle_event(const struct device *dev, struct input_event *event, 
     }
 
     if (p1 & INPUT_MIXER_SENSOR1) {
+        if (data->single_sensor_enabled && data->single_sensor_primary != 1) {
+            goto event_cleanup;
+        }
 #if IS_ENABLED(CONFIG_POINTER_2S_MIXER_ENSURE_SYNC)
         data->last_sensor1_report = now;
 #endif
@@ -473,6 +560,9 @@ static int sy_handle_event(const struct device *dev, struct input_event *event, 
             data->values.s1_y += event->value;
         }
     } else if (p1 & INPUT_MIXER_SENSOR2) {
+        if (data->single_sensor_enabled && data->single_sensor_primary != 2) {
+            goto event_cleanup;
+        }
 #if IS_ENABLED(CONFIG_POINTER_2S_MIXER_ENSURE_SYNC)
         data->last_sensor2_report = now;
 #endif
@@ -484,11 +574,14 @@ static int sy_handle_event(const struct device *dev, struct input_event *event, 
         }
     }
 
+event_cleanup:
     event->value = 0;
     event->sync = false;
 
 #if IS_ENABLED(CONFIG_POINTER_2S_MIXER_ENSURE_SYNC)
-    if (unlikely(abs((int32_t) (data->last_sensor1_report - data->last_sensor2_report)) > CONFIG_POINTER_2S_MIXER_SYNC_WINDOW_MS)) {
+    if (!data->single_sensor_enabled &&
+        unlikely(abs((int32_t) (data->last_sensor1_report - data->last_sensor2_report)) >
+                 CONFIG_POINTER_2S_MIXER_SYNC_WINDOW_MS)) {
         memset(&data->values, 0, sizeof(struct p2sm_dataframe));
         memset(&data->twist_values, 0, sizeof(struct p2sm_dataframe));
         return 0;
@@ -625,7 +718,21 @@ static int data_init(const struct device *dev) {
     calculate_rotation_matrix(surface_p1[0], surface_p1[1], surface_p1[2], 0, 0, -radius, data->rotation_matrix1);
     calculate_rotation_matrix(surface_p2[0], surface_p2[1], surface_p2[2], 0, 0, -radius, data->rotation_matrix2);
 
+    data->single_sensor_enabled = config->single_sensor_mode;
+    data->single_sensor_primary = config->single_sensor_primary;
+    if (data->single_sensor_primary != 1 && data->single_sensor_primary != 2) {
+        LOG_WRN("Invalid single sensor primary value %d, defaulting to sensor 2", data->single_sensor_primary);
+        data->single_sensor_primary = 2;
+    }
+    data->single_sensor_log_samples = 0;
+
+    for (int i = 0; i < 4; i++) {
+        data->single_sensor_transform[i / 2][i % 2] =
+            ((float)config->single_sensor_transform[i]) / 1000.0f;
+    }
+
     data->last_twist_direction = -1;
+    data->last_pointer_emit = k_uptime_get();
     data->move_coef = 1.0f;
     data->twist_coef = 1.0f;
     data->max_history_entries = (config->twist_interference_window / config->sync_scroll_report_ms) + 1;
@@ -654,6 +761,12 @@ static int data_init(const struct device *dev) {
     LOG_DBG("  > Ball radius: %d", (int) config->ball_radius);
     LOG_DBG("  > Surface trackpoint 1 ≈ (%d, %d, %d)", (int) surface_p1[0], (int) surface_p1[1], (int) surface_p1[2]);
     LOG_DBG("  > Surface trackpoint 2 ≈ (%d, %d, %d)", (int) surface_p2[0], (int) surface_p2[1], (int) surface_p2[2]);
+    if (data->single_sensor_enabled) {
+        LOG_DBG("  > Single sensor mode (primary: %d)", data->single_sensor_primary);
+        LOG_DBG("    transform (x1000): [[%d, %d], [%d, %d]]",
+                config->single_sensor_transform[0], config->single_sensor_transform[1],
+                config->single_sensor_transform[2], config->single_sensor_transform[3]);
+    }
 
 #if IS_ENABLED(CONFIG_POINTER_2S_MIXER_FEEDBACK_EN)
     if (config->feedback_gpios.port != NULL) {
@@ -821,6 +934,10 @@ void p2sm_set_twist_coef(const float coef) {
 #endif
 }
 
+#define P2SM_SINGLE_SENSOR_TRANSFORM(idx, default_val)                                            \
+    COND_CODE_1(DT_INST_NODE_HAS_PROP(0, single_sensor_transform),                                \
+                (DT_INST_PROP_BY_IDX(0, single_sensor_transform, idx)), (default_val))
+
 static struct zip_pointer_2s_mixer_data data = {};
 static struct zip_pointer_2s_mixer_config config = {
     .sync_report_ms = DT_INST_PROP(0, sync_report_ms),
@@ -831,6 +948,14 @@ static struct zip_pointer_2s_mixer_config config = {
     .sensor1_pos = DT_INST_PROP(0, sensor1_pos),
     .sensor2_pos = DT_INST_PROP(0, sensor2_pos),
     .ball_radius = DT_INST_PROP(0, ball_radius),
+    .single_sensor_mode = DT_INST_PROP_OR(0, single_sensor_mode, 0),
+    .single_sensor_primary = DT_INST_PROP_OR(0, single_sensor_primary, 1),
+    .single_sensor_transform = {
+        P2SM_SINGLE_SENSOR_TRANSFORM(0, 1000),
+        P2SM_SINGLE_SENSOR_TRANSFORM(1, 0),
+        P2SM_SINGLE_SENSOR_TRANSFORM(2, 0),
+        P2SM_SINGLE_SENSOR_TRANSFORM(3, 1000),
+    },
     .feedback_gpios = GPIO_DT_SPEC_INST_GET_OR(0, feedback_gpios, { .port = NULL }),
     .feedback_extra_gpios = GPIO_DT_SPEC_INST_GET_OR(0, feedback_extra_gpios, { .port = NULL }),
     .twist_feedback_duration = DT_INST_PROP_OR(0, twist_feedback_duration, 0),

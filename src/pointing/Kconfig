@@ -89,6 +89,20 @@ config POINTER_2S_MIXER_DELTA_Y_OVER_TRANS_MAG_DIV
   int "Delta Y over translation mangitude divisor"
   default 3
 
+config POINTER_2S_MIXER_VEL_GATE_EN
+  bool "Velocity gate"
+  default n
+
+config POINTER_2S_MIXER_VEL_GATE_THR
+  int "Velocity gate threshold (counts/ms * 100)"
+  default 8
+  depends on POINTER_2S_MIXER_VEL_GATE_EN
+
+config POINTER_2S_MIXER_VEL_GATE_DEADZONE
+  int "Velocity gate deadzone (counts)"
+  default 1
+  depends on POINTER_2S_MIXER_VEL_GATE_EN
+
 config POINTER_2S_MIXER_FEEDBACK_MAX_CONTINUOUS
   int "Maximum continuous feedback duration, msec"
   default 150
