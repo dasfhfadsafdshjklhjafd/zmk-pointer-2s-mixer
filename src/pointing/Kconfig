@@ -103,6 +103,14 @@ config POINTER_2S_MIXER_VEL_GATE_DEADZONE
   default 1
   depends on POINTER_2S_MIXER_VEL_GATE_EN
 
+config POINTER_2S_MIXER_NORMALIZE_SINGLE_SENSOR_TRANSFORM
+  bool "Normalize single sensor transform"
+  default y
+  help
+    When enabled, single sensor transform matrices are orthonormalized at runtime
+    to avoid excessive gain or skew. Disable if you provide a calibrated transform
+    that intentionally includes non-orthogonal components.
+
 config POINTER_2S_MIXER_FEEDBACK_MAX_CONTINUOUS
   int "Maximum continuous feedback duration, msec"
   default 150
@@ -113,6 +121,6 @@ config POINTER_2S_MIXER_FEEDBACK_COOLDOWN
 
 config POINTER_2S_MIXER_EMA_ALPHA
   int "Alpha-value for EMA filter, N/100"
-  default 25
+  default 10
 
 endif # ZMK_POINTER_2S_MIXER

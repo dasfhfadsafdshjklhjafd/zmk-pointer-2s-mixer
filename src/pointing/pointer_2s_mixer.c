@@ -132,6 +132,9 @@ static void apply_coef(float coef, float *x, float *y);
 static void apply_single_sensor_transform(const struct zip_pointer_2s_mixer_data *data, float *x, float *y);
 static struct dataframe_history_entry* dataframe_history_add(const struct device *dev, const struct p2sm_dataframe *dataframe);
 static bool dataframe_history_cleanup(const struct device *dev, uint32_t cutoff_time);
+#if IS_ENABLED(CONFIG_POINTER_2S_MIXER_NORMALIZE_SINGLE_SENSOR_TRANSFORM)
+static void normalize_single_sensor_transform(struct zip_pointer_2s_mixer_data *data);
+#endif
 
 static int process_and_report(const struct device *dev) {
     struct zip_pointer_2s_mixer_data *data = dev->data;
@@ -149,16 +152,21 @@ static int process_and_report(const struct device *dev) {
             const float pre_transform_y = rotated_y;
             apply_single_sensor_transform(data, &rotated_x, &rotated_y);
             if (data->single_sensor_log_samples < 1000) {
-                LOG_INF("Single sensor sample %u (sensor %d): pre=(%d,%d) post=(%d,%d)",
+                /* LOG_INF("Single sensor sample %u (sensor %d): pre=(%d,%d) post=(%d,%d)",
                         data->single_sensor_log_samples,
                         data->single_sensor_primary,
                         (int)(pre_transform_x * 1000.0f),
                         (int)(pre_transform_y * 1000.0f),
                         (int)(rotated_x * 1000.0f),
-                        (int)(rotated_y * 1000.0f));
+                        (int)(rotated_y * 1000.0f)); */
                 data->single_sensor_log_samples++;
             }
         }
+
+#if IS_ENABLED(CONFIG_EFOG_TRACKBALL_POINTER_FLIPPED)
+        rotated_x = -rotated_x;
+        rotated_y = -rotated_y;
+#endif
 
         apply_coef(data->move_coef, &rotated_x, &rotated_y);
         if (dt > CONFIG_POINTER_2S_MIXER_REMAINDER_TTL) {
@@ -184,16 +192,21 @@ static int process_and_report(const struct device *dev) {
             const float pre_transform_y = rotated_y;
             apply_single_sensor_transform(data, &rotated_x, &rotated_y);
             if (data->single_sensor_log_samples < 1000) {
-                LOG_INF("Single sensor sample %u (sensor %d): pre=(%d,%d) post=(%d,%d)",
+                /* LOG_INF("Single sensor sample %u (sensor %d): pre=(%d,%d) post=(%d,%d)",
                         data->single_sensor_log_samples,
                         data->single_sensor_primary,
                         (int)(pre_transform_x * 1000.0f),
                         (int)(pre_transform_y * 1000.0f),
                         (int)(rotated_x * 1000.0f),
-                        (int)(rotated_y * 1000.0f));
+                        (int)(rotated_y * 1000.0f)); */
                 data->single_sensor_log_samples++;
             }
         }
+
+#if IS_ENABLED(CONFIG_EFOG_TRACKBALL_POINTER_FLIPPED)
+        rotated_x = -rotated_x;
+        rotated_y = -rotated_y;
+#endif
 
         apply_coef(data->move_coef, &rotated_x, &rotated_y);
         if (dt > CONFIG_POINTER_2S_MIXER_REMAINDER_TTL) {
@@ -730,6 +743,9 @@ static int data_init(const struct device *dev) {
         data->single_sensor_transform[i / 2][i % 2] =
             ((float)config->single_sensor_transform[i]) / 1000.0f;
     }
+#if IS_ENABLED(CONFIG_POINTER_2S_MIXER_NORMALIZE_SINGLE_SENSOR_TRANSFORM)
+    normalize_single_sensor_transform(data);
+#endif
 
     data->last_twist_direction = -1;
     data->last_pointer_emit = k_uptime_get();
@@ -764,9 +780,15 @@ static int data_init(const struct device *dev) {
     if (data->single_sensor_enabled) {
         LOG_DBG("  > Single sensor mode (primary: %d)", data->single_sensor_primary);
         LOG_DBG("    transform (x1000): [[%d, %d], [%d, %d]]",
-                config->single_sensor_transform[0], config->single_sensor_transform[1],
-                config->single_sensor_transform[2], config->single_sensor_transform[3]);
+                (int)(data->single_sensor_transform[0][0] * 1000.0f),
+                (int)(data->single_sensor_transform[0][1] * 1000.0f),
+                (int)(data->single_sensor_transform[1][0] * 1000.0f),
+                (int)(data->single_sensor_transform[1][1] * 1000.0f));
     }
+
+#if IS_ENABLED(CONFIG_EFOG_TRACKBALL_POINTER_FLIPPED)
+    LOG_DBG("  > Pointer axes inverted");
+#endif
 
 #if IS_ENABLED(CONFIG_POINTER_2S_MIXER_FEEDBACK_EN)
     if (config->feedback_gpios.port != NULL) {
@@ -963,3 +985,51 @@ static struct zip_pointer_2s_mixer_config config = {
     .twist_feedback_delay = DT_INST_PROP_OR(0, twist_feedback_delay, 0),
 };
 DEVICE_DT_INST_DEFINE(0, &sy_init, NULL, &data, &config, POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &sy_driver_api);
+#if IS_ENABLED(CONFIG_POINTER_2S_MIXER_NORMALIZE_SINGLE_SENSOR_TRANSFORM)
+static void normalize_single_sensor_transform(struct zip_pointer_2s_mixer_data *data) {
+    float (*m)[2] = data->single_sensor_transform;
+    bool adjusted = false;
+    const float eps = 1e-6f;
+
+    float len0 = sqrtf((m[0][0] * m[0][0]) + (m[0][1] * m[0][1]));
+    if (len0 < eps) {
+        m[0][0] = 1.0f;
+        m[0][1] = 0.0f;
+        len0 = 1.0f;
+        adjusted = true;
+    }
+
+    if (fabsf(len0 - 1.0f) > 1e-3f) {
+        m[0][0] /= len0;
+        m[0][1] /= len0;
+        adjusted = true;
+    }
+
+    float dot01 = (m[0][0] * m[1][0]) + (m[0][1] * m[1][1]);
+    if (fabsf(dot01) > 1e-6f) {
+        m[1][0] -= dot01 * m[0][0];
+        m[1][1] -= dot01 * m[0][1];
+        adjusted = true;
+    }
+
+    float len1 = sqrtf((m[1][0] * m[1][0]) + (m[1][1] * m[1][1]));
+    if (len1 < eps) {
+        m[1][0] = -m[0][1];
+        m[1][1] = m[0][0];
+        len1 = 1.0f;
+        adjusted = true;
+    }
+
+    if (fabsf(len1 - 1.0f) > 1e-3f) {
+        m[1][0] /= len1;
+        m[1][1] /= len1;
+        adjusted = true;
+    }
+
+    if (adjusted) {
+        LOG_DBG("Single sensor transform normalized to [[%d, %d], [%d, %d]] (x1000)",
+                (int)(m[0][0] * 1000.0f), (int)(m[0][1] * 1000.0f),
+                (int)(m[1][0] * 1000.0f), (int)(m[1][1] * 1000.0f));
+    }
+}
+#endif
