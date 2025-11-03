@@ -750,7 +750,11 @@ static int data_init(const struct device *dev) {
     data->last_twist_direction = -1;
     data->last_pointer_emit = k_uptime_get();
     data->move_coef = 1.0f;
+#ifdef CONFIG_EFOG_SCROLL_DEFAULT
+    data->twist_coef = ((float)CONFIG_EFOG_SCROLL_DEFAULT) / 1000.0f;
+#else
     data->twist_coef = 1.0f;
+#endif
     data->max_history_entries = (config->twist_interference_window / config->sync_scroll_report_ms) + 1;
     data->history_head_index = 0;
     data->history_count = 0;
